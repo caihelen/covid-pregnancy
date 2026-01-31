@@ -1,0 +1,509 @@
+---
+title: "Placenta pathway analysis"
+author: "Helen Cai"
+date: "2025-01-08"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The purpose of this notebook is to work through some overrepresentation/pathway analysis from the results of DEGs acquired from the placenta dataset. In a previous R notebook, we have generated some lists of DEGs, including their logFC and adjusted p-values. 
+
+```{r, eval=T, echo=F, message=F}
+library(dplyr)
+library(ggplot2)
+library(clusterProfiler)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+library(MetBrewer)
+library(enrichplot)
+library(ggupset)
+library(stringr)
+all_genes <- read.csv("conditioninfected-conditioncontrol-FULL.csv")
+```
+
+We will utilize the ClusterProfiler package. Refer to the following helpful book:
+https://yulab-smu.top/biomedical-knowledge-mining-book/clusterprofiler-go.html
+
+We need to take some time to specify a few pieces of information for the package. 
+First, we define the "universe" of genes to be considered: the list of all possible genes that were considered in the experiment. This will be taken from the "full" list of genes. It does not need to be ranked.
+
+Secondly, we need to define the interesting "gene(s)" that we want to look at. We will define one list of "positive" genes, or those DEGs with greater than +0.5 logFC. Likewise, we will define a list of "negative" genes, or those DEGs with a less than -0.5 logFC. These __must be ranked lists.__
+
+```{r, eval=F, echo=F, message=F, warning=F}
+# get Entrez IDs
+entrez_genes <- bitr(all_genes$ENSEMBL,
+                     fromType = "ENSEMBL",
+                     toType = "ENTREZID",
+                     OrgDb = org.Mm.eg.db)
+
+
+# merge IDs into the dataframe
+all_genes <- merge.data.frame(all_genes, entrez_genes, by.x="ENSEMBL", by.y="ENSEMBL")
+
+# get background genes
+bg_genes <- all_genes$ENTREZID
+
+# Prepare the gene lists (use Entrez IDs for ClusterProfiler)
+# set the FDR here
+all_genes_sig <- all_genes[all_genes$adj.P.Val < 0.20,]
+gene_list_sig <- all_genes_sig$logFC
+names(gene_list_sig) <- all_genes_sig$ENTREZID
+
+gene_list <- all_genes$logFC
+names(gene_list) <- all_genes$ENTREZID
+
+# key! need to make sure that the list is in descending order
+gene_list_sig <- sort(gene_list_sig, decreasing = T)
+gene_list <- sort(gene_list, decreasing=T)
+
+# what are the genes of interest?
+pos_genes <- gene_list_sig[gene_list_sig > 0.5] 
+neg_genes <- gene_list_sig[gene_list_sig < -0.5]
+
+```
+
+```{r, eval=F, echo=F, message=F}
+# 03/12/25 get list of coagulation-related genes/tx for Wesley
+temp <- all_genes_sig[all_genes_sig$logFC > 0.5,]
+temp <- temp[temp$adj.P.Val < 0.20,]
+temp <- temp$SYMBOL
+write.table(temp, "temp.csv", sep="\n", row.names=F, quote=F)
+
+```
+
+```{r, eval=F, echo=F, message=F}
+
+### Helper functions
+subset_and_dotplot <- function(merged_results, idx_to_subset, title = ""){
+  merged_results_subset <- merged_results@compareClusterResult[is.element(rownames(merged_results@compareClusterResult), idx_to_subset), ]
+  merged_results@compareClusterResult <- merged_results_subset
+  
+  
+  enrichplot::dotplot(merged_results,
+          showCategory = 30,
+          includeAll= TRUE,
+          font.size = 10,
+          title = title,
+          label_format = 80) + 
+    theme(axis.title.x=element_blank())
+}
+
+
+collate_results <- function(clusterprofiler_results, padj = 0.05, type="") {
+  results <- data.frame(ID = clusterprofiler_results@result$ID,
+                            Description = clusterprofiler_results@result$Description,
+                            p_adj = clusterprofiler_results@result$p.adjust)
+  results$type <- type
+  results_sig <- results[results$p_adj < 0.05,]
+  return(results_sig)
+}
+```
+
+
+## Upregulated genes
+ 
+
+```{r, eval=F, echo=F, message=F}
+######### overrepresentation analysis ######### 
+pos_go_enrich_MF <- enrichGO(gene = names(pos_genes),
+                          universe = bg_genes,
+                          OrgDb = org.Mm.eg.db,
+                          ont = "MF",
+                          pvalueCutoff = 0.05,
+                          qvalueCutoff = 0.05,
+                          readable=T)
+
+pos_go_enrich_CC <- enrichGO(gene = names(pos_genes),
+                          universe = bg_genes,
+                          OrgDb = org.Mm.eg.db,
+                          ont = "CC", # clear results for MF, CC
+                          pvalueCutoff = 0.05,
+                          qvalueCutoff = 0.05,
+                          readable=T)
+
+pos_go_enrich_BP <- enrichGO(gene = names(pos_genes),
+                          universe = bg_genes,
+                          OrgDb = org.Mm.eg.db,
+                          ont = "BP",
+                          pvalueCutoff = 0.05,
+                          qvalueCutoff = 0.20,
+                          readable=T)
+
+### KEGG overrepresentation
+pos_kegg_enrich <- enrichKEGG(gene=names(pos_genes),
+                              organism = "mmu",
+                              pvalueCutoff = 0.05)
+
+dotplot(pos_kegg_enrich, showCategory = 13, font.size=9)
+
+
+# visualize the results
+dotplot(pos_go_enrich_BP, showCategory = 13, font.size=9) 
+
+goplot(pos_go_enrich_BP, showCategory = 4, font.size=9)
+
+
+############ GO GSEA
+
+## there don't seem to be any negative enrichment scores/downregulated pathways
+gsea_results_BP <- gseGO(geneList = gene_list,  # full list of all ranked genes, from very positive down to very negative
+                      OrgDb = org.Mm.eg.db,
+                      ont = "BP",
+                      minGSSize = 10,
+                      maxGSSize = 500,
+                      pvalueCutoff = 0.05,
+                      nPerm = 1000)
+
+gsea_results_CC <- gseGO(geneList = gene_list,  # full list of all ranked genes, from very positive down to very negative
+                      OrgDb = org.Mm.eg.db,
+                      ont = "CC",
+                      minGSSize = 10,
+                      maxGSSize = 500,
+                      pvalueCutoff = 0.05,
+                      nPerm = 1000)
+
+gsea_results_MF <- gseGO(geneList = gene_list,  # full list of all ranked genes, from very positive down to very negative
+                      OrgDb = org.Mm.eg.db,
+                      ont = "MF",
+                      minGSSize = 10,
+                      maxGSSize = 500,
+                      pvalueCutoff = 0.05,
+                      nPerm = 1000)
+
+dotplot(gsea_results_BP, showCategory = 13, font.size=9)
+gseaplot2(gsea_results_BP, geneSetID=1:6)
+
+
+####### KEGG GSEA
+kegg_gse_results <- gseKEGG(geneList = gene_list,
+                            organism = "mmu",
+                            minGSSize = 15,
+                            pvalueCutoff = 0.05,
+                            verbose=F)
+
+
+kegg_gse_results_positive <- kegg_gse_results
+kegg_gse_results_positive@result <- kegg_gse_results[kegg_gse_results@result$enrichmentScore > 0, ]
+
+```
+
+
+## Make combined dotplot of interesting pathways (positive)
+```{r, eval=F, echo=F, message=F}
+pos_ora_merge <- merge_result(list(MF = pos_go_enrich_MF, 
+                                   BP = pos_go_enrich_BP, 
+                                   CC = pos_go_enrich_CC,
+                                   KEGG = pos_kegg_enrich))
+
+pos_ora_merge@compareClusterResult[["Description"]] <- gsub(" - Mus musculus [[:punct:]]house mouse[[:punct:]]", 
+                                                            "",
+                                                            pos_ora_merge@compareClusterResult[["Description"]])
+
+## picked out some of the more interesting pathways
+coagulation_wounding_complement <- c(6, 90, 157, 159, 167, 180, 183, 189, 204, 205, 321, 392, 465, 539, 555)
+growth <- c(20, 81, 156, 240, 272, 299, 327, 415, 505, 85, 130, 132, 156)
+prolactin_steroid_endocrine <- c(231, 18, 58, 79, 98, 122, 176, 190, 194, 250, 464, 542, 548)
+immune <- c(45, 118, 197, 198, 219, 432, 480, 494, 497)
+micronutrient <- c(14, 21, 33, 54, 115, 166, 193, 207, 237, 238, 366, 379, 382, 411, 442, 456, 495, 550, 556, 561, 563, 564, 569, 570)
+
+
+subset_and_dotplot(pos_ora_merge, coagulation_wounding_complement, "Coagulation and wounding-related pathways") + scale_x_discrete(labels=c('MF', 'BP', 'KEGG'))
+
+subset_and_dotplot(pos_ora_merge, growth, "Igf-related pathays")  + scale_x_discrete(labels=c('MF', 'BP'))
+
+subset_and_dotplot(pos_ora_merge, prolactin_steroid_endocrine, "Steroid metabolism-related pathways")  + scale_x_discrete(labels=c('MF', 'BP', 'KEGG'))
+
+subset_and_dotplot(pos_ora_merge, immune, "Immune-related pathways")  + scale_x_discrete(labels=c('MF', 'BP'))
+
+subset_and_dotplot(pos_ora_merge, micronutrient, "Micronutrient metabolism-related pathways") + scale_x_discrete(labels=c('MF', 'BP', "KEGG")) 
+
+```
+
+## Pick and choose some of the upregulated pathway and display on a barplot
+(for the figure)
+```{r, eval=F, echo=F, message=F}
+pos_go_enrich_MF <- collate_results(pos_go_enrich_MF, type="ORA")
+pos_go_enrich_CC <- collate_results(pos_go_enrich_CC, type="ORA")
+pos_go_enrich_BP <- collate_results(pos_go_enrich_BP, type="ORA")
+pos_kegg_enrich <- collate_results(pos_kegg_enrich, type="ORA")
+gsea_results_BP <- collate_results(gsea_results_BP, type="GSEA")
+gsea_results_CC <- collate_results(gsea_results_CC, type="GSEA")
+gsea_results_MF <- collate_results(gsea_results_MF, type="GSEA")
+kegg_gse_results_positive <- collate_results(kegg_gse_results_positive, type="GSEA")
+
+
+
+upreg_results <- rbind(pos_go_enrich_MF,
+                          pos_go_enrich_CC,
+                          pos_go_enrich_BP,
+                          pos_kegg_enrich,
+                          gsea_results_BP,
+                          gsea_results_CC,
+                          gsea_results_MF,
+                          kegg_gse_results_positive)
+upreg_results$Description <- gsub(" - Mus musculus [[:punct:]]house mouse[[:punct:]]", 
+                                  "", upreg_results$Description)
+upreg_results$Description <- gsub(",", "", upreg_results$Description)
+upreg_results$Description <- str_to_sentence(upreg_results$Description)
+upreg_results$Description[upreg_results$Description == "Vitamin b6 binding"] <- "Vitamin B6 binding"
+
+#write.csv(upreg_results, "upreg_results_0113.csv",
+#          quote=F, row.names = F)
+```
+
+```{r, eval=T, echo=F, message=F}
+
+upreg_results <- read.csv("upreg_results_0113.csv")
+
+upreg_results$Description <- gsub(" - Mus musculus [[:punct:]]house mouse[[:punct:]]", 
+                                  "", upreg_results$Description)
+upreg_results$Description <- gsub(",", "", upreg_results$Description)
+upreg_results$Description <- str_to_sentence(upreg_results$Description)
+upreg_results$Description[upreg_results$Description == "Vitamin b6 binding"] <- "Vitamin B6 binding"
+
+immuno_results <- c(150, 229, 230, 251, 45, 464, 848, 512)
+immuno_results <- upreg_results[immuno_results,]
+immuno_results <- immuno_results %>% arrange(p_adj * -1)
+immuno_results$Category <- "Immunologic"
+
+
+metabolism_results <- c(147, 14, 21, 198, 550, 225, 33, 239, 960)
+metabolism_results <- upreg_results[metabolism_results,]
+metabolism_results <- metabolism_results %>% arrange(p_adj * -1)
+metabolism_results$Category <- "Metabolic"
+
+coagulation_results <- c(539, 189, 199, 215, 236, 556)
+coagulation_results <- upreg_results[coagulation_results,]
+coagulation_results <- coagulation_results %>% arrange(p_adj * -1)
+coagulation_results$Category <- "Coagulation"
+
+
+plot_df <- rbind(coagulation_results, metabolism_results, immuno_results)
+plot_df$Description <- factor(plot_df$Description, levels = plot_df$Description)
+plot_df$Category <- factor(plot_df$Category, levels=c("Immunologic", "Metabolic", "Coagulation"))
+######### Create the horizontal barplots
+
+ggplot(plot_df, 
+       aes(x = factor(Description), y = -1*log10(p_adj), fill=Category)) + 
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  labs(title = "Upregulated Pathways in SARS-CoV-2 (Placenta)",
+       x="", y =bquote(-log[10]~"P-adj")) +
+  geom_hline(yintercept=-1*log10(0.05), linetype="dashed", color="black", size=0.5) +
+  theme_classic(base_size=12)+ 
+  theme(legend.position="none",
+        plot.title = element_text(size=11)) +
+  scale_fill_manual(values=c("#db664f", 
+                             "#7168a7",
+                             "#96705B"))
+
+ggsave("placenta-upreg-pathways-split-barplot_with_coag.pdf",
+       height = 10.5,
+       width = 17, 
+       units="cm")
+
+```
+
+```{r, eval=T, echo=F, message=F}
+upreg_results <- read.csv("upreg_results_0113.csv")
+
+plot_df <- upreg_results %>% arrange(p_adj)
+plot_df <- distinct(plot_df, Description, .keep_all=TRUE)
+plot_df <- head(plot_df, 15)
+plot_df$Description <- str_wrap(plot_df$Description, 55)
+plot_df <- plot_df[rev(rownames(plot_df)),]
+plot_df$Description <- factor(plot_df$Description, levels = plot_df$Description)
+
+plot_df$Category <- "Other"
+plot_df$Category[c(11)] <- "Immunologic"
+plot_df$Category[c(1, 2, 9, 10)] <- "Metabolic"
+plot_df$Category <- factor(plot_df$Category, 
+                           levels = c("Immunologic", "Metabolic", "Other"))
+
+######### Create the horizontal barplots
+
+ggplot(plot_df, 
+       aes(x = factor(Description), y = -1*log10(p_adj))) + 
+  geom_bar(stat = "identity", color = "black", fill="#db664f") +
+  coord_flip() +
+  labs(title = "Upregulated Pathways in SARS-CoV-2 (Placenta)",
+       x="", y =bquote(-log[10]~"P-adj")) +
+  geom_hline(yintercept=-1*log10(0.05), linetype="dashed", color="black", size=0.5) +
+  theme_classic(base_size=12)+ 
+  theme(legend.position="none",
+        plot.title = element_text(size=11)) 
+
+
+
+ggsave("placenta-upreg-pathways-barplot-top15-mono.pdf",
+       height = 10.5,
+       width = 17, 
+       units="cm")
+
+```
+
+
+
+
+## Downregulated genes
+
+```{r, eval=F, echo=F, message=F}
+######### Overrepresentation analysis ######### 
+
+neg_go_enrich_MF <- enrichGO(gene = names(neg_genes),
+                          universe = bg_genes,
+                          OrgDb = org.Mm.eg.db,
+                          ont = "MF",
+                          pvalueCutoff = 0.05,
+                          qvalueCutoff = 0.05,
+                          readable=T)
+
+neg_go_enrich_CC <- enrichGO(gene = names(neg_genes),
+                          universe = bg_genes,
+                          OrgDb = org.Mm.eg.db,
+                          ont = "CC",
+                          pvalueCutoff = 0.05,
+                          qvalueCutoff = 0.05,
+                          readable=T)  ## no results
+
+neg_go_enrich_BP <- enrichGO(gene = names(neg_genes),
+                          universe = bg_genes,
+                          OrgDb = org.Mm.eg.db,
+                          ont = "BP",
+                          pvalueCutoff = 0.05,
+                          qvalueCutoff = 0.05,
+                          readable=T) 
+
+# visualize the results
+dotplot(neg_go_enrich_MF, showCategory = 13, font.size=9)
+
+goplot(neg_go_enrich_MF, showCategory = 4, font.size=9)
+
+########## KEGG overrepresentation analysis
+
+neg_kegg_enrich <- enrichKEGG(gene=names(neg_genes),
+                              organism = "mmu",
+                              pvalueCutoff = 0.05)
+
+#dotplot(neg_kegg_enrich, showCategory = 13, font.size=9)
+
+####### KEGG GSEA
+
+# get negative enrichment scores from earlier results
+kegg_gse_results_negative <- kegg_gse_results
+kegg_gse_results_negative@result <- kegg_gse_results[kegg_gse_results@result$enrichmentScore < 0, ]
+# ribosome & proteasome--we probably don't care?
+gseaplot2(kegg_gse_results_negative, geneSetID=1:2)
+
+```
+
+## Summary barplot for interesting downregulated pathways
+```{r, eval=F, echo=F, message=F}
+neg_go_enrich_MF <- collate_results(neg_go_enrich_MF, type="ORA")
+kegg_gse_results_negative <- collate_results(kegg_gse_results_negative, type="GSEA")
+neg_go_enrich_BP <- collate_results(neg_go_enrich_BP, type="ORA")
+neg_kegg_enrich <- collate_results(neg_kegg_enrich, type="ORA")
+
+downreg_results <- rbind(neg_go_enrich_MF,
+                          kegg_gse_results_negative,
+                         neg_go_enrich_BP,
+                         neg_kegg_enrich)
+
+downreg_results$Description <- gsub(" - Mus musculus [[:punct:]]house mouse[[:punct:]]", 
+                                  "", downreg_results$Description)
+downreg_results$Description <- gsub(",", "", downreg_results$Description)
+downreg_results$Description <- str_to_sentence(downreg_results$Description)
+downreg_results$Description <- gsub("jak-stat", "JAK-STAT", downreg_results$Description)
+downreg_results$Description <- gsub("stat", "STAT", downreg_results$Description)
+
+#write.csv(downreg_results, "downreg_results_0113.csv",
+#          quote=F, row.names = F)
+
+interesting_idx_downreg <- c(1, 2, 3, 4, 8, 10, 12, 13, 16, 17, 18, 19, 25, 26)
+downreg_results_sub <- downreg_results[interesting_idx_downreg,]
+```
+
+```{r, eval=T, echo=F, message=F}
+downreg_results <- read.csv("downreg_results_0113.csv")
+
+downreg_results$Description <- gsub(" - Mus musculus [[:punct:]]house mouse[[:punct:]]", 
+                                  "", downreg_results$Description)
+downreg_results$Description <- gsub(",", "", downreg_results$Description)
+downreg_results$Description <- str_to_sentence(downreg_results$Description)
+downreg_results$Description <- gsub("jak-stat", "JAK-STAT", downreg_results$Description)
+downreg_results$Description <- gsub("stat", "STAT", downreg_results$Description)
+
+metabolism_results <- c(1, 8, 2, 10, 3, 4, 12, 13, 16, 18, 19, 25, 26)
+metabolism_results <- downreg_results[metabolism_results,]
+metabolism_results <- metabolism_results %>% arrange(p_adj * -1)
+metabolism_results$Category <- "Metabolic"
+
+plot_df <- rbind(metabolism_results)
+plot_df$Description <- str_wrap(plot_df$Description, 55)
+plot_df$Description <- factor(plot_df$Description, levels = plot_df$Description)
+
+######### Create the horizontal barplots
+ggplot(plot_df, 
+       aes(x = factor(Description), y = -1*log10(p_adj), fill=Category)) + 
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  labs(title = "Downregulated Pathways in SARS-CoV-2 (placenta)",
+       x="", y =bquote(-log[10]~"P-adj")) +
+  geom_hline(yintercept=-1*log10(0.05), linetype="dashed", color="black", size=0.5) +
+  theme_classic(base_size=12)+ 
+  theme(legend.position="none",
+        plot.title = element_text(size=11),
+        axis.text.y = element_text(lineheight = 0.61)) +
+  scale_fill_manual(values=c("#db664f"))
+
+
+ggsave("placenta-downreg-pathways-barplot.pdf",
+       height = 10.5,
+       width = 17, 
+       units="cm")
+
+
+```
+
+```{r, eval=T, echo=F, message=F}
+downreg_results <- read.csv("downreg_results_0113.csv")
+downreg_results$Description <- gsub("Ecm", "ECM", downreg_results$Description)
+
+plot_df <- downreg_results %>% arrange(p_adj)
+plot_df <- distinct(plot_df, Description, .keep_all=TRUE)
+plot_df <- head(plot_df, 15)
+plot_df$Description <- str_wrap(plot_df$Description, 55)
+plot_df <- plot_df[rev(rownames(plot_df)),]
+plot_df$Description <- factor(plot_df$Description, levels = plot_df$Description)
+
+plot_df$Category <- "Metabolic"
+plot_df$Category[c(15)] <- "Immunologic"
+plot_df$Category[c(1, 6, 12)] <- "Other"
+
+plot_df$Category <- factor(plot_df$Category, 
+                           levels = c("Immunologic", "Metabolic", "Other"))
+
+######### Create the horizontal barplots
+
+ggplot(plot_df, 
+       aes(x = factor(Description), y = -1*log10(p_adj))) + 
+  geom_bar(stat = "identity", color = "black", fill="#7168a7") +
+  coord_flip() +
+  labs(title = "Downregulated Pathways in SARS-CoV-2 (Placenta)",
+       x="", y =bquote(-log[10]~"P-adj")) +
+  geom_hline(yintercept=-1*log10(0.05), linetype="dashed", color="black", size=0.5) +
+  theme(legend.position="none") +
+  theme_classic()+ 
+  theme(plot.title = element_text(size=11)) 
+
+
+
+ggsave("placenta-downreg-pathways-barplot-mono.pdf",
+       height = 10.5,
+       width = 17, 
+       units="cm")
+
+```

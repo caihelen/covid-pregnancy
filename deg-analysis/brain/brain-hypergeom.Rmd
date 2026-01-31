@@ -1,0 +1,653 @@
+---
+title: "Brain hypergeometric testing"
+author: "Helen Cai"
+date: "2025-01-17"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, eval=T, echo=F, message=F}
+library(dplyr)
+library(ggplot2)
+library(tximport)
+library(clusterProfiler)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+library(MetBrewer)
+library(AnnotationHub)
+library(enrichplot)
+library(ggupset)
+library(edgeR)
+
+library(readxl)
+library(stringr)
+
+library(ggrepel)
+```
+
+## Hypergeometric testing on custom gene lists
+We want to be able to perform geometric testing to determine if the DEGs that are present are specifically enriched for neuropsychiatric risk genes. 
+
+We can use base R to conduct the hypergeometric test. The tricky part is doing the data wrangling and making sure that the parameters are set up correctly. 
+Helpful biostars page:
+https://support.bioconductor.org/p/9146885/#9146889
+
+## Define the background/urn from which to draw
+We will define all of our balls by *those which have a valid gene symbol*. Note that this will be an entirely different universe from those of Entrez IDs or ENSEMBL IDs, since the universe of gene symbols is far sparser!!
+```{r, eval=T, echo=F, message=F, warning=F}
+## get bg genes
+
+metadata <- read.csv("../covid_metadata_MY.csv", row.names=1)
+
+table(metadata$age, metadata$cond)
+table(metadata$age, metadata$sex)
+attach(metadata)
+
+hub = AnnotationHub()
+ensdb_query <- query(hub, c("EnsDb", "musculus", "100"))
+
+# retrieve the record
+ensdb_111 <- ensdb_query[["AH116340"]]
+# convert to df
+tx_data <- transcripts(ensdb_111, return.type="DataFrame")
+tx2gene <- tx_data[, c("tx_id", "gene_id")]
+
+# get paths of salmon output files
+output_dir <- "/home/hsc26/pi_pattabiraman/project/covid-bulk/preprocess/salmon_outs/"
+output_files <- paste0(output_dir, rownames(metadata), "/quant.sf")
+
+names(output_files) <- rownames(metadata)
+
+# nice tutorial for importing from txi here:
+# https://bioconductor.org/packages/devel/bioc/vignettes/tximport/inst/doc/tximport.html#limma-voom
+
+txi_brain <- tximport(output_files, type="salmon", tx2gene=tx2gene,
+                      countsFromAbundance="lengthScaledTPM", ignoreTxVersion=T)
+
+# create a DGEList()
+y <- DGEList(txi_brain$counts)
+
+# calculate normalization factors
+y <- calcNormFactors(y)
+
+# filter lowly-expressed genes
+cutoff <- 1
+drop <- which(apply(cpm(y), 1, max) < cutoff)
+d <- y[-drop,]
+dim(d)
+
+
+## we're interested in the universe of all genes from which balls could be drawn
+# which means we want to look at the expression data after filtering out low counts
+gene_ids <- rownames(d$counts)
+db <- AnnotationDbi::select(org.Mm.eg.db, keytype="ENSEMBL", keys=gene_ids, columns="SYMBOL")
+bg_genes <- na.omit(unique(db$SYMBOL))
+
+n_plus_m <- length(bg_genes)
+```
+
+
+### Reading in list of DEGs
+```{r, eval=T, echo=F, message=F}
+## draw the balls from the urn, e.g. get the DEGs
+# we actually don't care about the logFC, we just want to see if they are changed or not
+
+diff_genes <- read.csv("group_age_condP5_sars-group_age_condP5_pbs-FULL.csv")
+degs <- diff_genes[diff_genes$adj.P.Val < 0.05,]
+
+
+#diff_genes <- read.csv("../placenta_degs/conditioninfected-conditioncontrol-FULL.csv")
+#degs <- diff_genes[diff_genes$adj.P.Val < 0.20,]
+
+degs <- degs[abs(degs$logFC) > 0.25,]
+degs <- na.omit(degs$SYMBOL)
+
+k <- length(degs)
+```
+
+## Create the conversion table for going from human gene symbols to mouse
+
+```{r, eval=T, echo=F, message=F}
+library(org.Hs.eg.db)
+
+convert_symbols <- function(gene_list) {
+
+    # go from human symbol to human ENSEMBL ID
+    human_symbols <- 
+    AnnotationDbi::select(org.Hs.eg.db, keytype="SYMBOL", keys=gene_list, columns="ENSEMBL")
+    
+    # go from human ENSEMBL ID to mouse ENSEMBL ID 
+    ortholog_table <- read.csv("/home/hsc26/pi_pattabiraman/project/atlas/hg38_to_mm_ensembl_orthologs.txt",
+                               sep="\t")
+    ortholog_table <- as.data.frame(ortholog_table)
+    ortholog_table <- merge.data.frame(human_symbols, ortholog_table, by.x = "ENSEMBL", by.y = "Gene.stable.ID")
+    
+    # extract mouse symbols
+    symbols <- ortholog_table[,c("SYMBOL", "Mouse.gene.name")]
+    symbols <- unique(symbols$Mouse.gene.name)
+    
+    # note that we do not care about ordering within this list, 
+    # so we can just go ahead and return the column of gene symbols as-is
+
+    return(symbols)
+}
+```
+
+
+
+
+### SCZ risk genes
+```{r, eval=T, echo=F, message=F}
+butler <- data.frame(read_excel("/home/hsc26/pi_pattabiraman/project/atlas/List of schizophrenia genes.xlsx", sheet = 1))
+butler <- convert_symbols(butler$Gene.symbol)
+
+q <- sum(degs %in% butler) #42
+m <- length(butler) #560
+n <- n_plus_m - m #15142
+
+butler_p <- phyper(q, m, n, k, lower.tail = T)
+butler_q <- q
+butler_m <- m
+```
+
+```{r, eval=T, echo=F, message=F}
+owens <- data.frame(read_excel("/home/hsc26/pi_pattabiraman/project/atlas/List of schizophrenia genes.xlsx", sheet = 2, col_names = F))
+owens <- convert_symbols(owens$"...1")
+
+q <- sum(degs %in% owens) #10
+m <- length(owens) #227
+n <- n_plus_m - m #15475
+
+owens_p <- phyper(q, m, n, k, lower.tail = T)
+owens_q <- q
+owens_m <- m
+```
+
+```{r, eval=F, echo=F, message=F}
+# omit gulsuner data because it is specific to mid-fetal PFC
+gulsuner <- data.frame(read_excel("/home/hsc26/pi_pattabiraman/project/atlas/List of schizophrenia genes.xlsx", sheet = 3))
+gulsuner <- convert_symbols(gulsuner$"Gulnsuner.et.al.2013")
+
+q <- sum(degs %in% gulsuner) #3
+m <- length(gulsuner) #62
+n <- n_plus_m - m #15640
+
+gulsuner_p <- phyper(q, m, n, k, lower.tail = T)
+gulsuner_q <- q
+gulsuner_m <- m
+```
+### ASD genes
+
+```{r, eval=T, echo=F, message=F}
+sfari <- read.csv("/home/hsc26/pi_pattabiraman/project/atlas/SFARI/SFARI-Gene_genes_08-19-2024release_08-25-2024export.csv")
+
+sfari_cat1 <- sfari[sfari$gene.score == "1",]
+sfari_cat1 <- unique(sfari_cat1$gene.symbol)
+sfari_cat1 <- convert_symbols(sfari_cat1)
+
+q <- sum(degs %in% sfari_cat1) #12
+m <- length(sfari_cat1) #234
+n <- n_plus_m - m #15468
+
+sfari_cat1_p <- phyper(q, m, n, k, lower.tail = T)
+sfari_cat1_q <- q
+sfari_cat1_m <- m
+```
+
+```{r, eval=T, echo=F, message=F}
+sfari_cat2 <- sfari[sfari$gene.score == "2",]
+sfari_cat2 <- unique(sfari_cat2$gene.symbol)
+sfari_cat2 <- convert_symbols(sfari_cat2)
+
+q <- sum(degs %in% sfari_cat2) #69
+m <- length(sfari_cat2) #709
+n <- n_plus_m - m #14993
+
+sfari_cat2_p <- phyper(q, m, n, k, lower.tail = T)
+sfari_cat2_q <- q
+sfari_cat2_m <- m
+```
+
+
+```{r, eval=T, echo=F, message=F}
+sfari_all <- unique(sfari$gene.symbol)
+sfari_all <- convert_symbols(sfari_all)
+
+q <- sum(degs %in% sfari_all) #98
+m <- length(sfari_all) #1191
+n <- n_plus_m - m #14511
+
+sfari_all_p <- phyper(q, m, n, k, lower.tail = T)
+sfari_all_q <- q
+sfari_all_m <- m
+#plot(dhyper(c(1:20), m, n, k))
+```
+
+### NIMH
+```{r, eval=T, echo=F, message=F}
+nimh_master <- data.frame(read_excel("/home/hsc26/pi_pattabiraman/project/atlas/NIMH_gene_list_version01_2023-09-21.xlsx"))
+nimh <- na.omit(unique(nimh_master$gene_symbol))
+nimh <- convert_symbols(nimh)
+
+q <- sum(degs %in% nimh) #53
+m <- length(nimh) #797
+n <- n_plus_m - m #14905
+
+# 011725 Get the list of overlapping genes for gene ontology
+ov <- degs[degs %in% nimh]
+write.table(data.frame(ov), file="temp.csv", row.names=F, quote=F)
+
+nimh_p <- phyper(q, m, n, k, lower.tail = T)
+nimh_q <- q
+nimh_m <- m
+```
+
+```{r, eval=T, echo=F, message=F}
+## NDD genes
+nimh_ndd <- nimh_master[nimh_master$trait %in% c("NDD", "NDD, SCZ"),]
+nimh_ndd <- na.omit(unique(nimh_ndd$gene_symbol))
+nimh_ndd <- convert_symbols(nimh_ndd)
+
+q <- sum(degs %in% nimh_ndd) #52
+m <- length(nimh_ndd) #769
+n <- n_plus_m - m #14933
+
+nimh_ndd_p <- phyper(q, m, n, k, lower.tail = T)
+nimh_ndd_q <- q
+nimh_ndd_m <- m
+```
+
+
+```{r, eval=T, echo=F, message=F}
+## SCZ genes
+nimh_scz <- nimh_master[nimh_master$trait %in% c("SCZ", "NDD, SCZ"),]
+nimh_scz <- na.omit(unique(nimh_scz$gene_symbol))
+nimh_scz <- convert_symbols(nimh_scz)
+
+q <- sum(degs %in% nimh_scz) #2
+m <- length(nimh_scz) #30
+n <- n_plus_m - m #15672
+
+nimh_scz_p <- phyper(q, m, n, k, lower.tail = T)
+nimh_scz_q <- q
+nimh_scz_m <- m
+```
+
+## Neuroimmune risk genes
+```{r, eval=T, echo=F, message=F}
+neuroimmune_master <- data.frame(read_excel("/home/hsc26/pi_pattabiraman/project/atlas/neuroimmune_supp_table3.xlsx", sheet = 3))
+neuroimmune <- na.omit(unique(neuroimmune_master$external_gene_id))
+neuroimmune <- convert_symbols(neuroimmune)
+
+q <- sum(degs %in% neuroimmune) #212
+m <- length(neuroimmune) #1275
+n <- n_plus_m - m #14427
+
+neuroimmune_p <- phyper(q, m, n, k, lower.tail = T)
+neuroimmune_q <- q
+neuroimmune_m <- m
+```
+
+```{r, eval=T, echo=F, message=F}
+## ASD
+neuroimmune_asd <- neuroimmune_master[neuroimmune_master$ASD.FDR < 0.05,]
+neuroimmune_asd <- convert_symbols(na.omit(neuroimmune_asd$external_gene_id))
+
+q <- sum(degs %in% neuroimmune_asd) #17
+m <- length(neuroimmune_asd) #275
+n <- n_plus_m - m #15427
+
+neuroimmune_asd_p <- phyper(q, m, n, k, lower.tail = T)
+neuroimmune_asd_q <- q
+neuroimmune_asd_m <- m
+
+```
+
+```{r, eval=T, echo=F, message=F}
+## AD
+neuroimmune_ad <- neuroimmune_master[neuroimmune_master$AD.FDR < 0.05,]
+neuroimmune_ad <- convert_symbols(na.omit(neuroimmune_ad$external_gene_id))
+
+q <- sum(degs %in% neuroimmune_ad) #30
+m <- length(neuroimmune_ad) #638
+n <- n_plus_m - m #15064
+
+neuroimmune_ad_p <- phyper(q, m, n, k, lower.tail = T)
+neuroimmune_ad_q <- q
+neuroimmune_ad_m <- m
+
+```
+
+```{r, eval=T, echo=F, message=F}
+## PD
+neuroimmune_pd <- neuroimmune_master[neuroimmune_master$PD.FDR < 0.05,]
+neuroimmune_pd <- convert_symbols(na.omit(neuroimmune_pd$external_gene_id))
+
+q <- sum(degs %in% neuroimmune_pd) #24
+m <- length(neuroimmune_pd) #97
+n <- n_plus_m - m #15605
+
+neuroimmune_pd_p <- phyper(q, m, n, k, lower.tail = T)
+neuroimmune_pd_q <- q
+neuroimmune_pd_m <- m
+
+```
+
+```{r, eval=T, echo=F, message=F}
+## MDD
+neuroimmune_mdd <- neuroimmune_master[neuroimmune_master$MDD.FDR < 0.05,]
+neuroimmune_mdd <- convert_symbols(na.omit(neuroimmune_mdd$external_gene_id))
+
+q <- sum(degs %in% neuroimmune_mdd) #2
+m <- length(neuroimmune_mdd) #27
+n <- n_plus_m - m #15675
+
+neuroimmune_mdd_p <- phyper(q, m, n, k, lower.tail = T)
+neuroimmune_mdd_q <- q
+neuroimmune_mdd_m <- m
+
+```
+
+```{r, eval=T, echo=F, message=F}
+## SCZ
+neuroimmune_scz <- neuroimmune_master[neuroimmune_master$SCZ.FDR < 0.05,]
+neuroimmune_scz <- convert_symbols(na.omit(neuroimmune_scz$external_gene_id))
+
+q <- sum(degs %in% neuroimmune_scz) #13
+m <- length(neuroimmune_scz) #220
+n <- n_plus_m - m #15482
+
+neuroimmune_scz_p <- phyper(q, m, n, k, lower.tail = T)
+neuroimmune_scz_q <- q
+neuroimmune_scz_m <- m
+
+```
+
+```{r, eval=T, echo=F, message=F}
+## BD
+neuroimmune_bd <- neuroimmune_master[neuroimmune_master$BD.FDR < 0.05,]
+neuroimmune_bd <- convert_symbols(na.omit(neuroimmune_bd$external_gene_id))
+
+q <- sum(degs %in% neuroimmune_bd) #2
+m <- length(neuroimmune_bd) #58
+n <- n_plus_m - m #15644
+
+neuroimmune_bd_p <- phyper(q, m, n, k, lower.tail = T)
+neuroimmune_bd_q <- q
+neuroimmune_bd_m <- m
+
+```
+
+## DISGENET Alzheimer's list
+```{r, eval=T, echo=F, message=F}
+disgenet_ad <- read.table("/home/hsc26/pi_pattabiraman/project/atlas/DISGENET/DISEASES_Summary_GDA_CURATED_C0002395_Alzheimer.tsv", sep="\t", header=T)
+disgenet_ad <- disgenet_ad$Gene
+disgenet_ad <- convert_symbols(disgenet_ad)
+
+q <- sum(degs %in% disgenet_ad) #26
+m <- length(disgenet_ad) #209
+n <- n_plus_m - m #15473
+
+disgenet_ad_p <- phyper(q, m, n, k, lower.tail=T)
+disgenet_ad_q <- q
+disgenet_ad_m <- m
+```
+
+## DISGENET Parkinson's list
+```{r, eval=T, echo=F, message=F}
+disgenet_pd <- read.table("/home/hsc26/pi_pattabiraman/project/atlas/DISGENET/DISEASES_Summary_GDA_CURATED_C0030567_Parkinson_Disease.tsv", sep="\t", header=T)
+disgenet_pd <- disgenet_pd$Gene
+disgenet_pd <- convert_symbols(disgenet_pd)
+
+q <- sum(degs %in% disgenet_pd) #17
+m <- length(disgenet_ad) #209
+n <- n_plus_m - m
+
+disgenet_pd_p <- phyper(q, m, n, k, lower.tail=T)
+disgenet_pd_q <- q
+disgenet_pd_m <- m
+
+```
+
+## DISGENET Schizophrenia list
+```{r, eval=T, echo=F, message=F}
+disgenet_scz <- read.table("/home/hsc26/pi_pattabiraman/project/atlas/DISGENET/DISEASES_Summary_GDA_CURATED_C0036341_Schizophrenia.tsv", sep="\t", header=T)
+disgenet_scz <- disgenet_scz$Gene
+disgenet_scz <- convert_symbols(disgenet_scz)
+
+q <- sum(degs %in% disgenet_scz) #165
+m <- length(disgenet_scz) #973
+n <- n_plus_m - m
+
+disgenet_scz_p <- phyper(q, m, n, k, lower.tail=T)
+disgenet_scz_q <- q
+disgenet_scz_m <- m
+
+```
+
+## DISGENET Bipolar disorder list
+```{r, eval=T, echo=F, message=F}
+disgenet_bd <- read.table("/home/hsc26/pi_pattabiraman/project/atlas/DISGENET/DISEASES_Summary_GDA_CURATED_C0005586_Bipolar_Disorders.tsv", sep="\t", header=T)
+disgenet_bd <- disgenet_bd$Gene
+disgenet_bd <- convert_symbols(disgenet_bd)
+
+q <- sum(degs %in% disgenet_bd) #86
+m <- length(disgenet_bd) #483
+n <- n_plus_m - m
+
+disgenet_bd_p <- phyper(q, m, n, k, lower.tail=T)
+disgenet_bd_q <- q
+disgenet_bd_m <- m
+
+```
+
+
+## DISGENET Neurodevelopmental delay list
+```{r, eval=T, echo=F, message=F}
+disgenet_ndd <- read.table("/home/hsc26/pi_pattabiraman/project/atlas/DISGENET/DISEASES_Summary_GDA_CURATED_C4022738_Neurodevelopmental_Delay.tsv", sep="\t", header=T)
+disgenet_ndd <- disgenet_ndd$Gene
+disgenet_ndd <- convert_symbols(disgenet_ndd)
+
+q <- sum(degs %in% disgenet_ndd) #86
+m <- length(disgenet_ndd) #483
+n <- n_plus_m - m
+
+disgenet_ndd_p <- phyper(q, m, n, k, lower.tail=T)
+disgenet_ndd_q <- q
+disgenet_ndd_m <- m
+
+```
+
+## DISGENET Major depressive disorder
+```{r, eval=T, echo=F, message=F}
+disgenet_mdd <- read.table("/home/hsc26/pi_pattabiraman/project/atlas/DISGENET/DISEASES_Summary_GDA_CURATED_C1269683_Major_depressive_disorder.tsv", sep="\t", header=T)
+disgenet_mdd <- disgenet_mdd$Gene
+disgenet_mdd <- convert_symbols(disgenet_mdd)
+
+q <- sum(degs %in% disgenet_mdd) #86
+m <- length(disgenet_mdd) #483
+n <- n_plus_m - m
+
+disgenet_mdd_p <- phyper(q, m, n, k, lower.tail=T)
+disgenet_mdd_q <- q
+disgenet_mdd_m <- m
+
+```
+
+
+
+## Alzheimer's disease: Bis et al 2019
+```{r, eval=T, echo=F, message=F}
+bis <- readLines("/home/hsc26/pi_pattabiraman/project/atlas/bis-alzheimers-supp.csv")
+bis <- gsub("\\[", " ", bis)
+bis <- gsub("\\]", " ", bis)
+bis <- gsub("\\(", " ", bis)
+bis <- gsub("\\)", " ", bis)
+bis <- gsub(",", " ", bis)
+bis <- gsub("(APOE)", "", bis)
+bis <- gsub("$", " ", bis)
+bis <- paste(bis, collapse="")
+
+bis <- strsplit(bis, " ")[[1]]
+bis[bis==""] <- NA
+bis <- unique(na.omit(bis))
+bis <- convert_symbols(bis)
+
+q <- sum(degs %in% bis) #201
+m <- length(bis) #2582
+n <- n_plus_m - m #13100
+
+bis_p <- phyper(q, m, n, k, lower.tail = T)
+bis_q <- q
+bis_m <- m
+```
+
+## Control dataset: Dana Farber Oncopanel genes
+```{r, eval=T, echo=F, message=F}
+oncopanel <- readLines("/home/hsc26/pi_pattabiraman/project/atlas/dana-farber-oncopanel.csv")
+oncopanel <- strsplit(oncopanel[2], ", ")[[1]]
+oncopanel <- convert_symbols(oncopanel)
+
+q <- sum(degs %in% oncopanel) #29
+m <- length(oncopanel) #305
+n <- n_plus_m - m #15377
+
+oncopanel_p <- phyper(q, m, n, k, lower.tail = T)
+oncopanel_q <- q
+oncopanel_m <- m
+```
+
+## Control dataset: FoundationOne CDx Solid Tumor genes
+https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0264138#pone.0264138.s001
+```{r, eval=T, echo=F, message=F}
+foundationone <- readLines("/home/hsc26/pi_pattabiraman/project/atlas/foundationone-solid-tumor-panel.csv")
+for (i in 2:length(foundationone)) {
+  foundationone[i] <- gsub("\\t", " ", foundationone[i])
+}
+
+foundationone <- paste(foundationone[2:length(foundationone)], collapse="")
+foundationone <- strsplit(foundationone, " ")[[1]]
+foundationone <- convert_symbols(foundationone)
+
+q <- sum(degs %in% foundationone) #31
+m <- length(foundationone) #291
+n <- n_plus_m - m #15377
+
+foundationone_p <- phyper(q, m, n, k, lower.tail = T)
+foundationone_q <- q
+foundationone_m <- m
+```
+
+## Make a summary visualization
+
+```{r, eval=T, echo=F, message=F}
+options(ggrepel.max.overlaps = Inf) 
+
+p_vals <- c(butler_p, owens_p, disgenet_scz_p,
+            sfari_cat1_p, sfari_cat2_p, sfari_all_p,
+            nimh_p, nimh_ndd_p, nimh_scz_p,
+            neuroimmune_p, neuroimmune_asd_p, neuroimmune_ad_p,
+            neuroimmune_pd_p, neuroimmune_mdd_p, neuroimmune_scz_p,
+            neuroimmune_bd_p,
+            oncopanel_p, foundationone_p,
+            bis_p, disgenet_ad_p,
+            disgenet_pd_p,
+            disgenet_bd_p, disgenet_ndd_p, disgenet_mdd_p)
+
+q_vals <- c(butler_q, owens_q, disgenet_scz_q,
+            sfari_cat1_q, sfari_cat2_q, sfari_all_q,
+            nimh_q, nimh_ndd_q, nimh_scz_q,
+            neuroimmune_q, neuroimmune_asd_q, neuroimmune_ad_q, 
+            neuroimmune_pd_q, neuroimmune_mdd_q, neuroimmune_scz_q,
+            neuroimmune_bd_q,
+            oncopanel_q, foundationone_q,
+            bis_q, disgenet_ad_q,
+            disgenet_pd_q,
+            disgenet_bd_q, disgenet_ndd_q, disgenet_mdd_q)
+
+m_vals <- c(butler_m, owens_m, disgenet_scz_m,
+            sfari_cat1_m, sfari_cat2_m, sfari_all_m,
+            nimh_m, nimh_ndd_m, nimh_scz_m,
+            neuroimmune_m, neuroimmune_asd_m, neuroimmune_ad_m, 
+            neuroimmune_pd_m, neuroimmune_mdd_m, neuroimmune_scz_m,
+            neuroimmune_bd_m,
+            oncopanel_m, foundationone_m,
+            bis_m, disgenet_ad_m,
+            disgenet_pd_m,
+            disgenet_bd_m, disgenet_ndd_m, disgenet_mdd_m)
+
+syndrome <- c("SCZ", "SCZ", "SCZ",
+              "ASD", "ASD", "ASD",
+              "Many", "NDD", "SCZ",
+              "Many", "ASD", "AD", "PD", "MDD", "SCZ",
+              "BD",
+                "Ctrl", "Ctrl",
+              "AD", "AD",
+              "PD",
+              "BD", "NDD", "MDD")
+
+sources <- c("Other", "Other", "DISGENET",
+             "SFARI", "SFARI", "SFARI", 
+             "NIMH", "NIMH", "NIMH",
+             "Chen 2023", "Chen 2023", "Chen 2023",
+             "Chen 2023", "Chen 2023", "Chen 2023", 
+             "Chen 2023",
+             "Other", "Other",
+             "Bis 2020", "DISGENET",
+             "DISGENET",
+             "DISGENET", "DISGENET", "DISGENET")
+
+
+df <- data.frame(p_vals = p_vals, q_vals = q_vals, m_vals = m_vals,
+                 syndrome = syndrome, sources = sources)
+
+# Define color palette for syndromes
+color_palette <- c("SCZ" = "lightblue", "ASD" = "orange", "Many" = "darkgreen", 
+                   "AD" = "purple", "NDD" = "pink",
+                   "PD" = "black", "MDD" = "brown", "BD" = "darkgrey",
+                   "Ctrl" = "navy")
+
+# first, create dotplot over # of overlapping genes
+ggplot(df, aes(x = -log10(p_vals), y = log10(q_vals), color = syndrome, shape = sources)) +
+  geom_point(size = 3) + # Adjust dot size if necessary
+  geom_text_repel(aes(label = syndrome, color = syndrome)) + 
+  geom_vline(xintercept = -log10(0.01), linetype = "dashed", color = "red") +
+  annotate("text", x = -log10(0.01), y = -0.1, 
+           label = "p = 0.01", color = "red", vjust = -1) +
+  scale_color_manual(values = color_palette) +
+  labs(
+    x = "-log10(p)",
+    y = "log10(# overlapping genes)",
+    title = "Gene list hypergeometric testing (P5 brain; logFC > 0.25 or < -0.25)"
+  ) +
+  xlim(-1, 6) +
+  theme_minimal() +
+  guides(color = guide_legend(ncol = 2), shape = guide_legend(ncol = 2))
+
+ggsave("hypergeometric-P5.pdf",
+       width = 10,
+       height = 5,
+       units = "in")
+```
+
+```{r, eval=T, echo=F, message=F}
+# then, look at # of genes in the gene list (in case this just happens to be artifact)
+ggplot(df, aes(x = -log10(p_vals), y = log10(m_vals), color = syndrome, shape = sources)) +
+  geom_point(size = 3) + # Adjust dot size if necessary
+  geom_text_repel(aes(label = syndrome, color = syndrome)) + 
+  geom_vline(xintercept = -log10(0.01), linetype = "dashed", color = "red") +
+  annotate("text", x = -log10(0.01), y = -0.1, 
+           label = "p = 0.01", color = "red", vjust = -1) +
+  scale_color_manual(values = color_palette) +
+  labs(
+    x = "-log10(p)",
+    y = "log10(# genes in syndrome list)",
+    title = "Gene list hypergeometric testing (brain; logFC > 0.25 or < -0.25)"
+  ) +
+  xlim(-0.5, 10) +
+  theme_minimal()
+
+```

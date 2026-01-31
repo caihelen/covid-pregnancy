@@ -1,0 +1,332 @@
+---
+title: "COVID bulk RNA seq"
+author: "H. Cai"
+date: "2025-01-07"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=T, out.width="170%", fig.width = 6.8)
+```
+
+The purpose of this notebook is to work through some bulk RNA-seq data generated from Wesley and Matt. The data are from mothers that are either infected with COVID (experimental) or injected with PBS (control). 
+
+In addition to these experimental contrasts, there are 2 arms to the data: one set of data collected from brain (at ages E15, P5, and P30) and one set of data collected from placenta (not stratified by age). 
+
+## Workflow
+Workflow will be standardized for the two arms of the data (brain vs placenta). Quality control will be performed with fastqc; followed by adapter trimming with fastp; and finally, pseudoalignment with Salmon against the mm39 reference provided by YCGA. 
+
+
+## Placenta: metadata
+
+The metadata for placental data is contained within the filename; e.g., "C" for control and "I" for infected. 
+
+```{r, eval=T, echo=F, message=F}
+library(ggplot2)
+library(dplyr)
+library(reshape)
+library(MetBrewer)
+
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+library(ggrepel)
+
+
+# get paths of salmon output files
+output_dir <- "/home/hsc26/pi_pattabiraman/project/covid-bulk/placenta/salmon_outs/"
+
+metadata <- list.dirs(output_dir, full.names=F, recursive=F)
+metadata_short <- c(1:8)
+for (i in 1:length(metadata)){
+  split <- strsplit(metadata[i], "_")
+  metadata_short[i] <- paste0(split[[1]][1], "_", split[[1]][2])
+}
+```
+
+
+## Placenta: reading in Salmon files
+
+I've previously taken steps to QC (fastq), trim reads (fastp), and pseudo-align reads (Salmon) on the HPC. 
+We note that for the results of fastp, for all of the reads the number of Q30 bases is at least 95% (and all Q20 bases are at least 97%).
+
+The results of Salmon are quant.sf files. We will need to read them in and transform into a counts matrix using some tximport. 
+
+```{r, eval=T, echo=F, message=F}
+library(tidyverse)
+library(clusterProfiler)
+library(tximport)
+library(AnnotationHub)
+library(limma)
+library(edgeR)
+
+hub = AnnotationHub()
+ensdb_query <- query(hub, c("EnsDb", "musculus", "100"))
+
+# retrieve the record
+ensdb_111 <- ensdb_query[["AH116340"]]
+# convert to df
+tx_data <- transcripts(ensdb_111, return.type="DataFrame")
+tx2gene <- tx_data[, c("tx_id", "gene_id")]
+
+
+output_files <- paste0(output_dir, metadata, "/quant.sf")
+
+names(output_files) <- metadata_short
+
+txi_placenta <- tximport(output_files, type="salmon", tx2gene=tx2gene,
+                      countsFromAbundance="lengthScaledTPM", ignoreTxVersion=T)
+```
+
+## limma-voom analysis
+
+I will be following the vignette presented here:
+https://ucdavis-bioinformatics-training.github.io/2018-June-RNA-Seq-Workshop/thursday/DE.html
+
+```{r, eval=T, echo=F, message=F}
+
+# create a DGEList()
+y <- DGEList(txi_placenta$counts)
+
+# calculate normalization factors
+y <- calcNormFactors(y)
+
+# filter lowly-expressed genes
+cutoff <- 1
+drop <- which(apply(cpm(y), 1, max) < cutoff)
+d <- y[-drop,]
+dim(d)
+```
+
+After filtering genes that are expressed less than 1x per million counts, we go from 56057 total genes to 15568 (a nearly 3/4 reduction).
+
+```{r, eval=T, echo=F, message=F}
+# since we dropped an item, we need to re-format the metadata to make sure it is identical to 
+# the order within the counts table
+rm(metadata)
+rm(metadata_short)
+metadata_short <- gsub("_[0-9]", "", colnames(y$counts))
+condition <- gsub("C", "control", metadata_short)
+condition <- gsub("I", "infected", condition)
+condition <- factor(condition)
+
+# make the multidimensional scaling (MDS) plot
+colors <- as.numeric(condition)
+symbols <- as.numeric(as.factor(condition)) + 14
+plotMDS(d, col=colors, pch=symbols, main="Placenta MDS plot")
+legend_labels <- levels(factor(condition))
+legend("bottomright", legend=legend_labels, col=1:length(legend_labels), pch=(1:length(legend_labels))+14)
+
+```
+
+Based on the MDS plot, it appears that the samples segregate well by the experimental condition; along the first dimension, positive (to the right) values appear to correlate with infection, while negative (to the left) values appear to correlate with control/non-infection.
+
+```{r, eval=T, echo=T, message=F}
+
+# specify the model to be fitted
+# since we only have one variable, this should be trivial
+mm <- model.matrix(~condition)
+
+# voom!
+y <- voom(d, mm, plot=T)
+```
+The mean-variance plot looks good (e.g. J-shaped, without plateaus and edges). This is a sign that we chose a suitable cutoff for lowly-expressed genes. 
+
+## PCA plot
+
+We took a look at the MDS plot earlier, but it would also be helpful to look at a PCA plot to determine degree of correlation:
+```{r, eval=T, echo=F, message=F}
+# recall that an EList holds expression values on the log scale 
+# (e.g. after background correction and normalization)
+pca <- prcomp(t(y$E))
+
+pca_scores <- data.frame(pca$x)
+pca_scores$condition <- as.character(condition)
+pca_scores$condition[pca_scores$condition == "control"] <- "PBS"
+pca_scores$condition[pca_scores$condition == "infected"] <- "SARS2"
+pca_scores$sample <- rownames(pca_scores)
+
+# add percent variance to the axes
+pca_var <- pca$sdev^2
+pca_var_per <- round(pca_var/sum(pca_var)*100, 1)
+pc1_lab <- paste0("PC1 (", pca_var_per[1], "%)")
+pc2_lab <- paste0("PC2 (", pca_var_per[2], "%)")
+
+# create the ggplot
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = condition, label=sample)) +
+  geom_text_repel() +
+  geom_point(size = 3) +  # Adjust size as needed
+  labs(title = "Placenta PCA plot", x = pc1_lab, y = pc2_lab) +
+  scale_color_manual(values=c("#0086C3", "#FD4C4F")) +
+  theme_classic(base_size=13) +
+  theme(legend.position = "none")  # Position legend to the right
+
+ggsave("placenta-pca-plot_with-labels.pdf",
+       height = 11,
+       width = 9, 
+       units="cm")
+
+```
+
+From this PCA plot, we draw the same conclusions as from the MDS plot: the two conditions separate well along the first dimension/PC1. The points are not necessarily well-clustered, but I suspect that this has more to do with PC2 (e.g. if we project the points onto PC1 in 1D space, the control points fall together, while the infected points fall along a spectrum).
+
+How much percent variation do PC1 and PC2 account for?
+
+```{r, eval=T, echo=F, message=F}
+pca_var <- pca$sdev^2
+pca_var_per <- round(pca_var/sum(pca_var)*100, 1)
+print(pca_var_per[1:2])
+barplot(pca_var_per, main="Elbow plot", xlab="PC", ylab="Percent variation")
+
+```
+
+## PC loading
+Since PC1 appears to be meaningful--the positive direction of PC1 is correlated with infected status, and the negative direction of PC1 is correlated with control status--it may be helpful to dig into the principal components loading to determine what genes are associated with either direction. 
+
+```{r, eval=T, echo=F, message=F, warning=F}
+loading_pc1 <- data.frame(pca$rotation[,1])
+colnames(loading_pc1) <- "pc_loadings"
+
+# get gene symbols from ENSEMBL ID
+gene_db <- AnnotationDbi::select(org.Mm.eg.db, keys=rownames(loading_pc1), keytype="ENSEMBL",
+                  columns=c("SYMBOL"))
+
+loading_pc1 <- merge(gene_db, loading_pc1, by.x="ENSEMBL", by.y=0)
+```
+
+What are the top 20 most heavily loaded gens toward the positive direction, e.g. associated with SARS infection status?
+
+```{r, eval=T, echo=F, message=F, warning=F}
+
+head(loading_pc1 %>% arrange(pc_loadings * -1), 20)
+```
+What about the genes associated with the negative direction, e.g. with control status?
+
+```{r, eval=T, echo=F, message=F, warning=F}
+head(loading_pc1 %>% arrange(pc_loadings * 1), 20)
+```
+## Obtaining differential expression
+
+Let's move on to fitting the linear model and determining coefficients for each gene.
+
+```{r, eval=T, echo=F, message=F}
+
+# fit linear model using limma
+# lmFit fits a linear model using weighted least squares for each gene
+fit <- lmFit(y, mm)
+coef.fit <- fit$coefficients
+#head(coef(fit))
+```
+Now that we have lists of coefficients, we can begin to determine which groups we want to compare. 
+
+```{r, eval=T, echo=T, message=F}
+# comparisons between groups (log-fold changes) are obtained as contrasts of fitted linear models
+# need to specify which groups to compare
+# for instance, to compare infected to control:
+contr <- makeContrasts(conditioninfected,
+                       levels=colnames(coef(fit)))
+
+# estimate contrast for each gene
+tmp <- contrasts.fit(fit, contr)
+
+# empirical Bayes smoothing of standard errors 
+# (shrinks standard errors that are much larger or smaller than those from other genes towards the average standard error)
+tmp <- eBayes(tmp)
+
+
+# print out DEGs
+top_table <- topTable(tmp, sort.by="P", n=Inf)
+gene_db <- AnnotationDbi::select(org.Mm.eg.db, keys=rownames(top_table), keytype="ENSEMBL",
+                  columns=c("SYMBOL"))
+
+top_table <- merge(gene_db, top_table, by.x="ENSEMBL", by.y=0)
+
+print(sum(top_table$adj.P.Val < 0.05))
+print(sum(top_table$adj.P.Val < 0.20))
+```
+
+All of these genes will be saved into a csv: "./placenta_degs/conditioninfected-conditioncontrol-FULL.csv"
+
+```{r, eval=T, echo=F, message=F}
+#write.csv(top_table %>% arrange(adj.P.Val),
+#          "./placenta_degs/conditioninfected-conditioncontrol-FULL.csv",
+#          row.names=F, quote=F)
+```
+
+## Volcano plot
+
+```{r, eval=T, echo=F, message=F}
+# Add a column for significance, usually set a threshold for adjusted p-value or logFC
+top_table$Significant <- "Not Significant"
+top_table$Significant[top_table$adj.P.Val < 0.2 & top_table$logFC > 0.5] <- "Significantly Upregulated"
+top_table$Significant[top_table$adj.P.Val < 0.2 & top_table$logFC < -0.5] <- "Significantly Downregulated"
+top_table$Significant[top_table$adj.P.Val < 0.2 & top_table$logFC > 0 & top_table$logFC < 0.5] <- "Moderately Upregulated"
+top_table$Significant[top_table$adj.P.Val < 0.2 & top_table$logFC < 0 & top_table$logFC > -0.5] <- "Moderately Downregulated"
+
+
+# set up labels for the top 10 most upregulated and most downregulated genes
+tails <- sort(top_table$logFC, index.return=T)$ix
+top_table$label <- ""
+top_table$label[tails[1:10]] <- top_table$SYMBOL[tails[1:10]]
+top_table$label[rev(tails)[1:10]] <- top_table$SYMBOL[rev(tails)[1:10]]
+
+# Create the volcano plot using ggplot2
+ggplot(top_table, aes(x=logFC, y=-log10(adj.P.Val), color=Significant, label=label)) +
+  geom_point(size=2) +
+  scale_color_manual(values=c("Not Significant"="#BEBEBE", "Significantly Upregulated"="#EB4445",
+                              "Significantly Downregulated"="#78B2D3", "Moderately Upregulated"="#F36F6E",
+                              "Moderately Downregulated"="#A8CFE4")) +
+  theme_classic(base_size=13) +
+  labs(title="",
+       x="Log2 Fold Change",
+       y=bquote(-log[10]~"P-adj"),
+       color="Significance")  +
+  geom_text_repel(aes(label = label), na.rm = TRUE, min.segment.length = 0) +
+  theme(legend.position="none") +
+  geom_vline(xintercept=c(-0.5, 0.5), linetype="dashed", color="darkgray") +      
+  geom_hline(yintercept=-log10(0.2), linetype="dashed", color="darkgray")
+
+
+ggsave("placenta-volcano-plot.pdf",
+       height = 11,
+       width = 9,
+       units = "cm")
+```
+
+
+
+```{r, eval=T, echo=F, message=F}
+# Do the same plot but using unadjusted p values
+top_table$Significant <- "Not Significant"
+top_table$Significant[top_table$P.Value < 0.2 & top_table$logFC > 0.5] <- "Significantly Upregulated"
+top_table$Significant[top_table$P.Value < 0.2 & top_table$logFC < -0.5] <- "Significantly Downregulated"
+top_table$Significant[top_table$P.Value < 0.2 & top_table$logFC > 0 & top_table$logFC < 0.5] <- "Moderately Upregulated"
+top_table$Significant[top_table$P.Value < 0.2 & top_table$logFC < 0 & top_table$logFC > -0.5] <- "Moderately Downregulated"
+
+
+# set up labels for the top 10 most upregulated and most downregulated genes
+tails <- sort(top_table$logFC, index.return=T)$ix
+top_table$label <- ""
+top_table$label[tails[1:10]] <- top_table$SYMBOL[tails[1:10]]
+top_table$label[rev(tails)[1:10]] <- top_table$SYMBOL[rev(tails)[1:10]]
+
+# Create the volcano plot using ggplot2
+ggplot(top_table, aes(x=logFC, y=-log10(P.Value), color=Significant, label=label)) +
+  geom_point(size=2) +
+  scale_color_manual(values=c("Not Significant"="#BEBEBE", "Significantly Upregulated"="#EB4445",
+                              "Significantly Downregulated"="#78B2D3", "Moderately Upregulated"="#F36F6E",
+                              "Moderately Downregulated"="#A8CFE4")) +
+  theme_classic(base_size=13) +
+  labs(title="",
+       x="Log2 Fold Change",
+       y=bquote(-log[10]~"P-value"),
+       color="Significance")  +
+  geom_text_repel(aes(label = label), na.rm = TRUE, min.segment.length = 0) +
+  theme(legend.position="none") +
+  geom_vline(xintercept=c(-0.5, 0.5), linetype="dashed", color="darkgray") +      
+  geom_hline(yintercept=-log10(0.2), linetype="dashed", color="darkgray")
+
+ggsave("placenta-volcano-plot_unadj.pdf",
+       height = 11,
+       width = 9,
+       units = "cm")
+```

@@ -1,0 +1,712 @@
+---
+title: "COVID bulk RNA seq"
+author: "H. Cai"
+date: "2025-01-06"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=T, out.width="170%", fig.width = 6.8)
+```
+
+The purpose of this notebook is to work through some bulk RNA-seq data generated from Wesley and Matt. The data are from pups born to mothers that are either infected with COVID (experimental) or injected with PBS (control). 
+
+In addition to these experimental contrasts, there are 2 arms to the data: one set of data collected from brain (at ages E15, P5, and P30) and one set of data collected from placenta (not stratified by age). 
+
+## Workflow
+Workflow will be standardized for the two arms of the data (brain vs placenta). Quality control will be performed with fastqc; followed by adapter trimming with fastp; and finally, pseudoalignment with Salmon against the mm39 reference provided by YCGA. 
+
+For DEG analysis, we can opt for either DESeq2 or limma-voom. Here, I will choose to utilize limma-voom for analysis, for two primary reasons. Firstly, we have a large dataset; limma-voom reportedly has better memory handling at large scale. Secondly, we have multiple contrasts for the brain dataset (e.g. 3 timepoints and 2 experimental conditions); the linear model fit by limma-voom appears to better accommodate this. 
+
+## Brain: metadata
+
+We first start with the sequencing data collected from brain (Matt). 
+
+```{r, eval=T, echo=F, message=F}
+library(ggplot2)
+library(dplyr)
+library(reshape)
+library(MetBrewer)
+
+metadata <- read.csv("covid_metadata_MY.csv", row.names=1)
+
+metadata <- na.omit(metadata)
+table(metadata$age, metadata$cond)
+table(metadata$age, metadata$sex)
+attach(metadata)
+```
+
+I've currently coded the condition to contain separate information on whether they were PBSx1 or PBSx2. Let's create a separate `condition` variable to remove some of this redundancy and simply let us know whether they were SARS or PBS. 
+
+```{r, eval=T, echo=F, message=F, warning=F}
+metadata$condition <- gsub("x[12]", "", metadata$cond)
+ggplot(melt(table(metadata$age, metadata$condition)), aes(x=Var.1, y=value, fill=Var.2)) + 
+  geom_bar(position="dodge", stat="identity") + 
+  xlab("Age") + ylab("Count") + labs(fill="Condition") + 
+  scale_fill_manual(values=met.brewer("Derain", n=2))
+  
+```
+
+
+## Brain: reading in Salmon files
+
+I've previously taken steps to QC (fastq), trim reads (fastp), and pseudo-align reads (Salmon) on the HPC. 
+We note that for the results of fastp, for all of the reads the number of Q30 bases is at least 90% (and the overwhelming number of Q20 bases is at least 97%).
+
+The results of Salmon are quant.sf files. We will need to read them in and transform into a counts matrix using some tximport. 
+
+```{r, eval=T, echo=F, message=F}
+library(tidyverse)
+library(clusterProfiler)
+library(tximport)
+library(AnnotationHub)
+library(limma)
+library(edgeR)
+
+hub = AnnotationHub()
+ensdb_query <- query(hub, c("EnsDb", "musculus", "100"))
+
+# retrieve the record
+ensdb_111 <- ensdb_query[["AH116340"]]
+# convert to df
+tx_data <- transcripts(ensdb_111, return.type="DataFrame")
+tx2gene <- tx_data[, c("tx_id", "gene_id")]
+
+# get paths of salmon output files
+output_dir <- "/home/hsc26/pi_pattabiraman/project/covid-bulk/preprocess/salmon_outs/"
+output_files <- paste0(output_dir, rownames(metadata), "/quant.sf")
+
+names(output_files) <- rownames(metadata)
+
+txi_brain <- tximport(output_files, type="salmon", tx2gene=tx2gene,
+                      countsFromAbundance="lengthScaledTPM", ignoreTxVersion=T)
+```
+
+## limma-voom analysis
+
+```{r, eval=T, echo=F, message=F}
+
+# create a DGEList()
+y <- DGEList(txi_brain$counts)
+
+# calculate normalization factors
+y <- calcNormFactors(y)
+
+# filter lowly-expressed genes
+cutoff <- 1
+drop <- which(apply(cpm(y), 1, max) < cutoff)
+d <- y[-drop,]
+dim(d)
+```
+
+After filtering genes that are expressed less than 1x per million counts, we go from 56057 total genes to 17969 (a 2/3 reduction).
+
+```{r, eval=T, echo=F, message=F}
+# make sure that the metadata is in the same order as the column names of the counts table
+#colnames(y$counts) == rownames(metadata)
+
+# derive interactions between age, sex, and condition
+group_age_cond <- interaction(metadata$age, metadata$condition)
+
+# make the multidimensional scaling (MDS) plot
+colors <- as.numeric(group_age_cond)
+symbols <- as.numeric(as.factor(group_age_cond)) + 14
+plotMDS(d, col=colors, pch=symbols, main="Brain MDS plot (all data)")
+legend_labels <- levels(factor(group_age_cond))
+legend("bottomleft", legend=legend_labels, col=1:length(legend_labels), pch=(1:length(legend_labels))+14)
+
+```
+
+Based on the MDS plot, it appears that the samples segregate well by age. Age appears to be the first dimension; e.g. moving right to left, age goes up.  There appears to be subtle, minimal segregation within age points based on condition (e.g. at P5 and E15, SARS condition is shifted down and to the right).
+
+```{r, eval=T, echo=T, message=F}
+
+# specify the model to be fitted
+# case 1: simple interaction between group and age
+#mm <- model.matrix(~0 + group_age_cond)
+
+# case 2: specify multiple-factor model
+#mm <- model.matrix(~age*condition*sex)
+
+# case 3: specify a two-factor model and correct by sex
+mm <- model.matrix(~0 + group_age_cond + sex)
+
+# voom!
+y <- voom(d, mm, plot=T)
+```
+The mean-variance plot looks good (e.g. J-shaped, without plateaus and edges). This is a sign that we chose a suitable cutoff for lowly-expressed genes. 
+
+We took a look at the MDS plot earlier, but it would also be helpful to look at a PCA plot to determine relationships:
+```{r, eval=T, echo=F, message=F}
+# recall that an EList holds expression values on the log scale 
+# (e.g. after background correction and normalization)
+pca <- prcomp(t(y$E))
+
+pca_scores <- data.frame(pca$x)
+pca_scores$Group <- factor(group_age_cond)
+
+# create the ggplot
+# Plotting the PCA results with ggplot2
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = Group, shape = Group)) +
+  geom_point(size = 3) +  # Adjust size as needed
+  labs(title = "Brain PCA plot (all data)", x = "PC1", y = "PC2") +
+  theme_classic() +
+  theme(legend.position = "right")  # Position legend to the right
+
+```
+
+Based on the principal components plot, it seems that the same conclusions from the MDS plot are borne out; e.g., the data points are segregated by age, and are subtly segregated by SARS condition at P5 and E15. 
+
+Let's move on to fitting the linear model and determining coefficients for each gene.
+
+```{r, eval=T, echo=F, message=F}
+
+# fit linear model using limma
+# lmFit fits a linear model using weighted least squares for each gene
+fit <- lmFit(y, mm)
+coef.fit <- fit$coefficients
+#head(coef(fit))
+```
+Now that we have lists of coefficients, we can begin to determine which groups we want to compare. 
+
+```{r, eval=T, echo=F, message=F}
+# comparisons between groups (log-fold changes) are obtained as contrasts of fitted linear models
+# need to specify which groups to compare
+# for instance, to compare SARS vs PBS for age E15:
+contr <- makeContrasts(group_age_condE15.sars - group_age_condE15.pbs,
+                       levels=colnames(coef(fit)))
+
+# estimate contrast for each gene
+tmp <- contrasts.fit(fit, contr)
+
+# empirical Bayes smoothing of standard errors 
+# (shrinks standard errors that are much larger or smaller than those from other genes towards the average standard error)
+tmp <- eBayes(tmp)
+
+# print out DEGs
+top_table <- topTable(tmp, sort.by="P", n=Inf)
+```
+
+With an FDR of < 0.05, we have 5805 DEGs.
+With an FDR of < 0.10, we have 7118 DEGs.
+
+For now, we stick with an FDR of 0.05. 
+
+## Converting gene names
+
+The gene names that we currently have are currently in the form of Ensembl IDs, which are not necessarily the most legible to the reader. Let's convert these to gene symbols. 
+
+```{r, echo=F, message=F, eval=T}
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+
+gene_db <- AnnotationDbi::select(org.Mm.eg.db, keys=rownames(top_table), keytype="ENSEMBL",
+                  columns=c("SYMBOL"))
+
+top_table_symbols <- merge(gene_db, top_table, by.x="ENSEMBL", by.y=0)
+top_table_symbols <- top_table_symbols[sort(abs(top_table_symbols$logFC), decreasing = T, index.return=T)$ix,]
+#head(top_table_sig_symbols, 15)
+```
+
+
+We now repeat this analysis for other groups of contrasts. Let's "keep" all of the data in the already-normalized and transformed data, and carefully select comparisons to get the contrast of interest. The reason for this is that the increased degrees of freedom allow for more precise estimation of variance, resulting in "improved" test statistics. 
+
+## E15 PCA
+Let's try to put together a PCA plot of data from this timepoint only. 
+
+```{r, eval=T, echo=F, message=F}
+
+E15_samps <- rownames(metadata)[metadata$age=="E15"]
+E15_exp <- y$E[,colnames(y$E) %in% E15_samps]
+pca <- prcomp(t(E15_exp))
+
+pca_scores <- data.frame(pca$x)
+pca_scores$condition <- factor(metadata$condition[metadata$age=="E15"])
+pca_scores$sex <- factor(metadata$sex[metadata$age=="E15"])
+pca_scores$sample <- rownames(pca_scores)
+
+pca_scores$condition <- gsub("sars", "SARS2", pca_scores$condition)
+pca_scores$condition <- gsub("pbs", "PBS", pca_scores$condition)
+
+# add percent variance to the axes
+pca_var <- pca$sdev^2
+pca_var_per <- round(pca_var/sum(pca_var)*100, 1)
+pc1_lab <- paste0("PC1 (", pca_var_per[1], "%)")
+pc2_lab <- paste0("PC2 (", pca_var_per[2], "%)")
+
+# create the ggplot
+# Plotting the PCA results with ggplot2
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = condition, shape = sex, label = sample)) +
+  geom_point(size = 3) +  # Adjust size as needed
+  labs(title = "Brain PCA plot (E15)", x = pc1_lab, y = pc2_lab) +
+  scale_color_manual(values=c("#0086C3", "#FD4C4F")) +
+  theme_classic(base_size=12) +
+  theme(legend.position = "none")  # Position legend to the right
+
+ggsave("brain-E15-pca-plot.pdf",
+       height = 11,
+       width = 9, 
+       units="cm")
+```
+
+How much percent variation do PC1 and PC2 account for?
+
+```{r, eval=T, echo=F, message=F}
+pca_var <- pca$sdev^2
+pca_var_per <- round(pca_var/sum(pca_var)*100, 1)
+print(pca_var_per[1:2])
+barplot(pca_var_per, main="Elbow plot", xlab="PC", ylab="Percent variation")
+
+```
+
+Here, we note that the PBS and SARS conditions may exhibit some amount of overlap, but otherwise separate along PC1. We also note that neither PC1 or PC2 correspond to sex. 
+
+## E15 principal component loadings
+
+Let's figure out what is in each of these PC loadings, namely if we can argue that PC2 is somehow linked to sex. 
+
+```{r, eval=T, echo=F, message=F, warning=F}
+loading_pc1 <- data.frame(pca$rotation[,1])
+colnames(loading_pc1) <- "pc_loadings"
+
+# get gene symbols from ENSEMBL ID
+gene_db <- AnnotationDbi::select(org.Mm.eg.db, keys=rownames(loading_pc1), keytype="ENSEMBL",
+                  columns=c("SYMBOL"))
+
+loading_pc1 <- merge(gene_db, loading_pc1, by.x="ENSEMBL", by.y=0)
+```
+
+Loadings that are more positive are associated with "rightward" shift on the plot, e.g. possibly associated more with the SARS condition. What are the top ~20 or so most positive genes?
+
+```{r, eval=T, echo=F, message=F}
+head(loading_pc1 %>% arrange(pc_loadings * -1), 20)
+```
+
+Unfortunately, it seems like many of these genes are not annotated/do not have corresponding gene symbols. What happens when we restrict this list to only the genes for which there is also a symbol?
+
+```{r, eval=T, echo=F, message=F}
+head(na.omit(loading_pc1) %>% arrange(pc_loadings * -1), 20)
+```
+
+Let's look at similar lists for negative loadings that are associated with "leftward" shift, e.g. more associated with the control condition. 
+
+```{r, eval=T, echo=F, message=F}
+head(loading_pc1 %>% arrange(pc_loadings), 20)
+```
+
+Let's also restrict the list to the genes for which there is an established gene symbol:
+
+```{r, eval=T, echo=F, message=F}
+head(na.omit(loading_pc1) %>% arrange(pc_loadings), 20)
+```
+
+We'll do the same process to look at PC2. 
+
+```{r, eval=T, echo=F, message=F, warning=F}
+loading_pc2 <- data.frame(pca$rotation[,2])
+colnames(loading_pc2) <- "pc_loadings"
+
+# get gene symbols from ENSEMBL ID
+gene_db <- AnnotationDbi::select(org.Mm.eg.db, keys=rownames(loading_pc2), keytype="ENSEMBL",
+                  columns=c("SYMBOL"))
+
+loading_pc2 <- merge(gene_db, loading_pc2, by.x="ENSEMBL", by.y=0)
+
+
+head(na.omit(loading_pc2) %>% arrange(pc_loadings * -1), 20)
+
+# head(na.omit(loading_pc2) %>% arrange(pc_loadings), 20)
+```
+
+
+# E15: DEGs
+The full list of DEGs is in: "./brain_degs/group_age_condE15_sars-group_age_condE15_pbs-FULL.csv"
+
+
+```{r, eval=T, echo=F, message = F}
+write.csv(top_table_symbols %>% arrange(adj.P.Val), "./brain_degs/group_age_condE15_sars-group_age_condE15_pbs-FULL.csv",
+          row.names=F, quote=F)
+```
+
+## E15: Volcano plot
+```{r, eval=T, echo=F, message=F}
+# Add a column for significance, usually set a threshold for adjusted p-value or logFC
+top_table$Significant <- "Not Significant"
+top_table$Significant[top_table$adj.P.Val < 0.05 & top_table$logFC > 0.5] <- "Significantly Upregulated"
+top_table$Significant[top_table$adj.P.Val < 0.05 & top_table$logFC < -0.5] <- "Significantly Downregulated"
+top_table$Significant[top_table$adj.P.Val < 0.05 & top_table$logFC > 0 & top_table$logFC < 0.5] <- "Moderately Upregulated"
+top_table$Significant[top_table$adj.P.Val < 0.05 & top_table$logFC < 0 & top_table$logFC > -0.5] <- "Moderately Downregulated"
+
+# Create the volcano plot using ggplot2
+ggplot(top_table, aes(x=logFC, y=-log10(adj.P.Val), color=Significant)) +
+  geom_point(size=2) +
+  scale_color_manual(values=c("Not Significant"="#BEBEBE", "Significantly Upregulated"="#EB4445",
+                              "Significantly Downregulated"="#78B2D3", "Moderately Upregulated"="#F36F6E",
+                              "Moderately Downregulated"="#A8CFE4")) +
+  theme_classic(base_size=12) +
+  labs(title="",
+       x="Log2 Fold Change",
+       y=bquote(-log[10]~"P-adj"),
+       color="Significance") +
+  theme(legend.position="none") +
+  geom_vline(xintercept=c(-0.5, 0.5), linetype="dashed", color="darkgray") +      
+  geom_hline(yintercept=-log10(0.05), linetype="dashed", color="darkgray") 
+
+ggsave("brain-E15-volcano-plot.pdf",
+       height = 11,
+       width = 9,
+       units="cm")
+```
+
+## P5: PCA
+
+```{r, eval=T, echo=F, message=F}
+P5_samps <- rownames(metadata)[metadata$age=="P5"]
+P5_exp <- y$E[,colnames(y$E) %in% P5_samps]
+pca <- prcomp(t(P5_exp))
+
+pca_scores <- data.frame(pca$x)
+pca_scores$condition <- factor(metadata$condition[metadata$age=="P5"])
+pca_scores$sex <- factor(metadata$sex[metadata$age=="P5"])
+pca_scores$sample <- rownames(pca_scores)
+pca_scores$condition <- gsub("sars", "SARS2", pca_scores$condition)
+pca_scores$condition <- gsub("pbs", "PBS", pca_scores$condition)
+
+# add percent variance to the axes
+pca_var <- pca$sdev^2
+pca_var_per <- round(pca_var/sum(pca_var)*100, 1)
+pc1_lab <- paste0("PC1 (", pca_var_per[1], "%)")
+pc2_lab <- paste0("PC2 (", pca_var_per[2], "%)")
+
+
+# create the ggplot
+# Plotting the PCA results with ggplot2
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = condition, shape = sex, label = sample)) +
+  geom_point(size = 3) +  # Adjust size as needed
+  labs(title = "Brain PCA plot (P5)", x = pc1_lab, y = pc2_lab) +
+  scale_color_manual(values=c("#0086C3", "#FD4C4F")) +
+  theme_classic(base_size=12) +
+  theme(legend.position = "none")  # Position legend to the right
+
+ggsave("brain-P5-pca-plot.pdf",
+       height = 11,
+       width = 9, 
+       units="cm")
+```
+
+
+This is a good-looking PCA plot. PC1 seems to correlate with PBS/SARS experimental condition. PC2 correlates nicely with sex. 
+
+How much percent variation do PC1 and PC2 account for?
+
+```{r, eval=T, echo=F, message=F}
+pca_var <- pca$sdev^2
+pca_var_per <- round(pca_var/sum(pca_var)*100, 1)
+print(pca_var_per[1:2])
+barplot(pca_var_per, main="Elbow plot", xlab="PC", ylab="Percent variation")
+
+```
+
+## P5 principal component loadings
+
+Since PC1 correlates nicely with experimental condition, it is worth taking some time digging into what might be in this principal component. 
+
+```{r, eval=T, echo=F, message=F, warning=F}
+loading_pc1 <- data.frame(pca$rotation[,1])
+colnames(loading_pc1) <- "pc_loadings"
+
+# get gene symbols from ENSEMBL ID
+gene_db <- AnnotationDbi::select(org.Mm.eg.db, keys=rownames(loading_pc1), keytype="ENSEMBL",
+                  columns=c("SYMBOL"))
+
+loading_pc1 <- merge(gene_db, loading_pc1, by.x="ENSEMBL", by.y=0)
+```
+
+Loadings that are more positive are associated with "rightward" shift on the plot, e.g. more with the SARS condition. What are the top ~20 or so most positive genes?
+
+```{r, eval=T, echo=F, message=F}
+head(loading_pc1 %>% arrange(pc_loadings * -1), 20)
+```
+
+Unfortunately, it seems like many of these genes are not annotated/do not have corresponding gene symbols. What happens when we restrict this list to only the genes for which there is also a symbol?
+
+```{r, eval=T, echo=F, message=F}
+head(na.omit(loading_pc1) %>% arrange(pc_loadings * -1), 20)
+```
+
+Let's look at similar lists for negative loadings that are associated with "leftward" shift, e.g. more associated with the control condition. 
+
+```{r, eval=T, echo=F, message=F}
+head(loading_pc1 %>% arrange(pc_loadings), 20)
+```
+
+Let's also restrict the list to the genes for which there is an established gene symbol:
+
+```{r, eval=T, echo=F, message=F}
+head(na.omit(loading_pc1) %>% arrange(pc_loadings), 20)
+```
+
+
+## P5: DEGs
+
+The full list of DEGs is in: "./brain_degs/group_age_condP5_sars-group_age_condP5_pbs-FULL.csv"
+
+```{r, eval=T, echo=F, message=F}
+# comparisons between groups (log-fold changes) are obtained as contrasts of fitted linear models
+# need to specify which groups to compare
+contr <- makeContrasts(group_age_condP5.sars - group_age_condP5.pbs,
+                       levels=colnames(coef(fit)))
+
+# estimate contrast for each gene
+tmp <- contrasts.fit(fit, contr)
+
+# empirical Bayes smoothing of standard errors 
+# (shrinks standard errors that are much larger or smaller than those from other genes towards the average standard error)
+tmp <- eBayes(tmp)
+
+# print out DEGs
+top_table <- topTable(tmp, sort.by="P", n=Inf)
+
+# get gene symbols
+gene_db <- AnnotationDbi::select(org.Mm.eg.db, keys=rownames(top_table), keytype="ENSEMBL",
+                  columns=c("SYMBOL"))
+top_table_symbols <- merge(gene_db, top_table, by.x="ENSEMBL", by.y=0)
+
+#write.csv(top_table_symbols %>% arrange(adj.P.Val), #"./brain_degs/group_age_condP5_sars-group_age_condP5_pbs-FULL.csv",
+#          row.names=F, quote=F)
+```
+
+
+## P5: Volcano plot
+
+```{r, eval=T, echo=F, message=F}
+# Add a column for significance, usually set a threshold for adjusted p-value or logFC
+top_table$Significant <- "Not Significant"
+top_table$Significant[top_table$adj.P.Val < 0.05 & top_table$logFC > 0.5] <- "Significantly Upregulated"
+top_table$Significant[top_table$adj.P.Val < 0.05 & top_table$logFC < -0.5] <- "Significantly Downregulated"
+top_table$Significant[top_table$adj.P.Val < 0.05 & top_table$logFC > 0 & top_table$logFC < 0.5] <- "Moderately Upregulated"
+top_table$Significant[top_table$adj.P.Val < 0.05 & top_table$logFC < 0 & top_table$logFC > -0.5] <- "Moderately Downregulated"
+
+# Create the volcano plot using ggplot2
+ggplot(top_table, aes(x=logFC, y=-log10(adj.P.Val), color=Significant)) +
+  geom_point(size=2) +
+  scale_color_manual(values=c("Not Significant"="#BEBEBE", "Significantly Upregulated"="#EB4445",
+                              "Significantly Downregulated"="#78B2D3", "Moderately Upregulated"="#F36F6E",
+                              "Moderately Downregulated"="#A8CFE4")) +
+  theme_classic(base_size=12) +
+  labs(title="",
+       x="Log2 Fold Change",
+       y=bquote(-log[10]~"P-adj"),
+       color="Significance") +
+  theme(legend.position="none") +
+  geom_vline(xintercept=c(-0.5, 0.5), linetype="dashed", color="darkgray") +      
+  geom_hline(yintercept=-log10(0.05), linetype="dashed", color="darkgray") 
+
+ggsave("brain-P5-volcano-plot-no_legend.pdf",
+       height = 11,
+       width = 9,
+       units = "cm")
+```
+
+There are clearly a lot of "significant"/red dots in the positive logFC quadrant, which corresponds with genes that are upregulated in SARS condition. We will pull these genes out for more specific pathway analysis.
+
+## P30: PCA
+
+```{r, eval=T, echo=F, message=F}
+P30_samps <- rownames(metadata)[metadata$age=="P30"]
+P30_exp <- y$E[,colnames(y$E) %in% P30_samps]
+pca <- prcomp(t(P30_exp))
+
+pca_scores <- data.frame(pca$x)
+pca_scores$condition <- factor(metadata$condition[metadata$age=="P30"])
+pca_scores$sex <- factor(metadata$sex[metadata$age=="P30"])
+pca_scores$condition <- gsub("sars", "SARS2", pca_scores$condition)
+pca_scores$condition <- gsub("pbs", "PBS", pca_scores$condition)
+
+
+# add percent variance to the axes
+pca_var <- pca$sdev^2
+pca_var_per <- round(pca_var/sum(pca_var)*100, 1)
+pc1_lab <- paste0("PC1 (", pca_var_per[1], "%)")
+pc2_lab <- paste0("PC2 (", pca_var_per[2], "%)")
+
+# create the ggplot
+# Plotting the PCA results with ggplot2
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = condition, shape = sex)) +
+  geom_point(size = 3) +  # Adjust size as needed
+  labs(title = "Brain PCA plot (P30)", x = pc1_lab, y = pc2_lab) +
+  scale_color_manual(values=c("#0086C3", "#FD4C4F")) +
+  theme_classic(base_size=12) +
+  theme(legend.position = "none")  # Position legend to the right
+
+ggsave("brain-P30-pca-plot.pdf",
+       height = 11,
+       width = 9, 
+       units="cm")
+```
+
+
+While it's not so clear what PC1 corresponds with, it seems that PC2 corresponds with sex. We will forego principal components loading analysis for now. 
+
+How much percent variation do PC1 and PC2 account for?
+
+```{r, eval=T, echo=F, message=F}
+pca_var <- pca$sdev^2
+pca_var_per <- round(pca_var/sum(pca_var)*100, 1)
+print(pca_var_per[1:2])
+#barplot(pca_var_per, main="Elbow plot", xlab="PC", ylab="Percent variation")
+
+```
+
+## P30: DEGs
+
+The full list of DEGs is in: "./brain_degs/group_age_condP30_sars-group_age_condP30_pbs-FULL.csv"
+
+```{r, eval=T, echo=F, message=F}
+# comparisons between groups (log-fold changes) are obtained as contrasts of fitted linear models
+# need to specify which groups to compare
+contr <- makeContrasts(group_age_condP30.sars - group_age_condP30.pbs,
+                       levels=colnames(coef(fit)))
+
+# estimate contrast for each gene
+tmp <- contrasts.fit(fit, contr)
+
+# empirical Bayes smoothing of standard errors 
+# (shrinks standard errors that are much larger or smaller than those from other genes towards the average standard error)
+tmp <- eBayes(tmp)
+
+# print out DEGs
+top_table <- topTable(tmp, sort.by="P", n=Inf)
+
+
+# get gene symbols
+gene_db <- AnnotationDbi::select(org.Mm.eg.db, keys=rownames(top_table), keytype="ENSEMBL",
+                  columns=c("SYMBOL"))
+top_table_symbols <- merge(gene_db, top_table, by.x="ENSEMBL", by.y=0)
+
+#write.csv(top_table_symbols %>% arrange(adj.P.Val), #"./brain_degs/group_age_condP30_sars-group_age_condP30_pbs-FULL.csv",
+#          row.names=F, quote=F)
+
+```
+
+
+## P30: Volcano plot
+
+```{r, eval=T, echo=F, message=F}
+# Add a column for significance, usually set a threshold for adjusted p-value or logFC
+top_table$Significant <- "Not Significant"
+top_table$Significant[top_table$adj.P.Val < 0.05 & top_table$logFC > 0.5] <- "Significantly Upregulated"
+top_table$Significant[top_table$adj.P.Val < 0.05 & top_table$logFC < -0.5] <- "Significantly Downregulated"
+top_table$Significant[top_table$adj.P.Val < 0.05 & top_table$logFC > 0 & top_table$logFC < 0.5] <- "Moderately Upregulated"
+top_table$Significant[top_table$adj.P.Val < 0.05 & top_table$logFC < 0 & top_table$logFC > -0.5] <- "Moderately Downregulated"
+
+# Create the volcano plot using ggplot2
+ggplot(top_table, aes(x=logFC, y=-log10(adj.P.Val), color=Significant)) +
+  geom_point(size=2) +
+  scale_color_manual(values=c("Not Significant"="#BEBEBE", "Significantly Upregulated"="#EB4445",
+                              "Significantly Downregulated"="#78B2D3", "Moderately Upregulated"="#F36F6E",
+                              "Moderately Downregulated"="#A8CFE4")) +
+  theme_classic(base_size=12) +
+  labs(title="",
+       x="Log2 Fold Change",
+       y=bquote(-log[10]~"P-adj"),
+       color="Significance") +
+  theme(legend.position="none") +
+  geom_vline(xintercept=c(-0.5, 0.5), linetype="dashed", color="darkgray") +      
+  geom_hline(yintercept=-log10(0.05), linetype="dashed", color="darkgray") 
+
+ggsave("brain-P30-volcano-plot.pdf",
+       height = 11,
+       width = 9,
+       units = "cm")
+
+
+
+```
+
+## Get list of significant genes
+We have generated 3 monstrous lists of DEGs, one for each timepoint. They are thousands of rows long. 
+Let's filter down these lists to what might be considered "significant," or a logFC of greater than +/-1 and adjusted P-value < 0.05. In other words, what are the red dots in each of the volcano plots?
+
+```{r, eval=T, echo=F, message=F}
+# let's read in each of the lists from .csvs
+E15 <- read.csv("./brain_degs/group_age_condE15_sars-group_age_condE15_pbs-FULL.csv")
+P5 <- read.csv("./brain_degs/group_age_condP5_sars-group_age_condP5_pbs-FULL.csv")
+P30 <- read.csv("./brain_degs/group_age_condP30_sars-group_age_condP30_pbs-FULL.csv")
+
+csv_list <- list("E15" = E15,
+                 "P5" = P5,
+                 "P30" = P30)
+
+for (i in 1:length(csv_list)) {
+  degs <- csv_list[[i]]
+  degs <- degs[degs$adj.P.Val < 0.05, ]
+  degs <- degs[abs(degs$logFC) > 1, ]
+  degs$age <- names(csv_list[i])
+  csv_list[[i]] <- degs
+}
+
+#write.csv(bind_rows(csv_list), "./brain_degs/brain-sars_pbs-logFC1_padj05.csv",
+#          row.names=F, quote=F)
+```
+
+The list of these genes is consolidated into one document: "./brain_degs/brain-sars_pbs-logFC1_padj05.csv". 
+
+## Heatmap
+First, we go ahead and make a heatmap for the data from all ages. 
+```{r, eval=T, echo=F, message=F}
+library(pheatmap)
+
+# Subset count data for DEGs
+# in an EList, the counts are already in log scale
+counts_degs <- y$E[rownames(top_table)[top_table$adj.P.Val < 0.05], ]
+
+# add annotations (e.g., sample groups)
+annotation_metadata <- data.frame(Age = metadata$age,
+                                  Condition = metadata$condition)
+rownames(annotation_metadata) <- colnames(counts_degs)
+
+
+pheatmap(counts_degs, 
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE, 
+         show_rownames = FALSE, 
+         show_colnames = FALSE,
+         scale = "row",
+         main = "Brain (all data): basic heatmap",
+         legend=T,
+         annotation_col = annotation_metadata,
+         color = colorRampPalette(c("#0086C3", "white", "#FD4C4F"))(50)
+         #color = met.brewer("Derain", n=100)
+         ) 
+
+```
+Next, we make a heatmap specifically for data at P5. 
+
+
+```{r, eval=T, echo=F, message=F}
+# add annotations (e.g., sample groups)
+annotation_metadata_P5 <- annotation_metadata[annotation_metadata$Age=="P5",]
+annotation_metadata_P5$Age <- NULL
+counts_degs_P5 <- counts_degs[,rownames(annotation_metadata_P5)]
+rownames(annotation_metadata_P5) <- colnames(counts_degs_P5)
+
+
+ann_colors = list(
+  Condition = c(pbs="#bec100", sars="#00cbff"))
+
+pheatmap(counts_degs_P5, 
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE, 
+         show_rownames = FALSE, 
+         show_colnames = FALSE,
+         scale = "row",
+         main = "Brain (P5): basic heatmap",
+         legend=T,
+         annotation_col = annotation_metadata_P5,
+         annotation_colors = ann_colors,
+         color = colorRampPalette(c("#0086C3", "white", "#FD4C4F"))(50)
+         #color = met.brewer("Derain", n=100)
+         ) 
+
+```
