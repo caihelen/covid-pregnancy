@@ -5,4 +5,4 @@ Authors: Wesley Tung, Matthew Yuen, Helen Cai, Hyesun Cho, Peiwen Lu, Harvey J K
 
 Primary Corresponding Author: Akiko Iwasaki, akiko.iwasaki@yale.edu, ORCID: 0000-0002-7824-9856
 
-Data are publicly available at: GSE317803
+Data are publicly available at: [GSE317803](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE317803)
